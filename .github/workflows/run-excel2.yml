@@ -1,0 +1,88 @@
+name: Run excel2 at 09:15 IST
+
+on:
+  schedule:
+    # 09:15 IST = 03:45 UTC; weekdays Mon-Fri
+    - cron: '45 3 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-excel2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip xvfb
+
+      - name: Set up Google Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Set up ChromeDriver
+        uses: nanasess/setup-chromedriver@v2
+
+      - name: Symlink chromedriver to expected path
+        run: |
+          sudo mkdir -p /opt/homebrew/bin
+          if [ -x "$(command -v chromedriver)" ]; then
+            CHROMEDRIVER_PATH=$(command -v chromedriver)
+          elif [ -f "/usr/local/bin/chromedriver" ]; then
+            CHROMEDRIVER_PATH=/usr/local/bin/chromedriver
+          else
+            CHROMEDRIVER_PATH=/usr/bin/chromedriver
+          fi
+          echo "Using chromedriver at: $CHROMEDRIVER_PATH"
+          sudo ln -sf "$CHROMEDRIVER_PATH" /opt/homebrew/bin/chromedriver
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create api_key.txt from secrets
+        env:
+          API_KEY: ${{ secrets.KITE_API_KEY }}
+          API_SECRET: ${{ secrets.KITE_API_SECRET }}
+          USER_ID: ${{ secrets.KITE_USER_ID }}
+          PASSWORD: ${{ secrets.KITE_PASSWORD }}
+          TOTP_SECRET: ${{ secrets.KITE_TOTP_SECRET }}
+        run: |
+          if [ -z "$API_KEY" ] || [ -z "$API_SECRET" ] || [ -z "$USER_ID" ] || [ -z "$PASSWORD" ] || [ -z "$TOTP_SECRET" ]; then
+            echo "One or more required secrets are missing." >&2
+            exit 1
+          fi
+          printf "%s %s %s %s %s\n" "$API_KEY" "$API_SECRET" "$USER_ID" "$PASSWORD" "$TOTP_SECRET" > api_key.txt
+
+      - name: Run excel2.py (headless) with timeout
+        env:
+          DISPLAY: :99
+        run: |
+          # Run in virtual framebuffer for headless browser
+          Xvfb :99 -screen 0 1920x1080x24 &
+          # Limit to 6 hours to fit the job timeout
+          timeout 6h python excel2.py || echo "excel2.py finished or timed out"
+
+      - name: Upload generated Excel files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-trades-excels
+          path: |
+            ./*.xlsx
+            ./STRATEGY/*.xlsx
+          if-no-files-found: warn
+
+

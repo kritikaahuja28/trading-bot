@@ -1,0 +1,8 @@
+kiteconnect==5.0.1
+pandas==2.2.2
+openpyxl==3.1.5
+selenium==4.23.1
+pyotp==2.9.0
+requests==2.32.3
+numpy==1.26.4
+

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local secrets
+api_key.txt
+access_token.txt
+request_token.txt
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Excel outputs
+*.xlsx
+*.numbers
+
+# Notebooks cache
+.ipynb_checkpoints/
+
