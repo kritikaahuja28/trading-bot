@@ -1,0 +1,28 @@
+name: Run Trading Bot
+
+on:
+  schedule:
+    - cron: '15 3 * * *'  # 9:15 AM IST (UTC +5:30 → 3:45 AM UTC; adjust as needed)
+  workflow_dispatch:   # Allows you to trigger manually if needed
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: Run script
+      env:
+        API_KEY: ${{ secrets.API_KEY }}
+        ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+      run: python excel2.py
