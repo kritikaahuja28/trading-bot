@@ -28,7 +28,7 @@ def autologin():
 
     service = ChromeService(executable_path="/opt/homebrew/bin/chromedriver")
     options = webdriver.ChromeOptions()
-    # options.add_argument('--headless')  # use this only if you're not debugging visually
+    options.add_argument('--headless')  # use this only if you're not debugging visually
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--incognito')
