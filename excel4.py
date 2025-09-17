@@ -1,3 +1,4 @@
+# updated_trading_bot_nifty50.py
 import time
 import datetime
 import numpy as np
@@ -15,15 +16,24 @@ warnings.filterwarnings("ignore")
 
 # --- Config ---
 EXCHANGE = "NSE"
-SYMBOLS = ["ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-           "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BHARTIARTL", "BRITANNIA",
-           "CIPLA", "COALINDIA", "DIVISLAB", "DRREDDY", "EICHERMOT",
-           "GRASIM", "ICICIBANK", "RELIANCE", "SHRIRAMFIN", "JSWSTEEL", "TECHM"]
+
+# --- NIFTY50 symbols (common tickers) ---
+# Edit this list if you want different or updated constituents.
+SYMBOLS = [
+    "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","HDFC","KOTAKBANK","SBIN","LT",
+    "AXISBANK","ITC","BHARTIARTL","HINDUNILVR","BAJFINSV","BAJFINANCE","MARUTI",
+    "M&M","POWERGRID","NTPC","ONGC","ULTRACEMCO","TATASTEEL","JSWSTEEL","SUNPHARMA",
+    "DRREDDY","COALINDIA","BPCL","IOC","GRASIM","TECHM","WIPRO","ADANIENT","ADANIPORTS",
+    "DIVISLAB","CIPLA","EICHERMOT","BRITANNIA","NESTLEIND","HCLTECH","HINDALCO","SBILIFE",
+    "TITAN","HDFCLIFE","INDUSINDBK","UPL","APOLLOHOSP","ASIANPAINT","TATAMOTORS","HEROMOTOCO",
+    "ONGC"  # duplicate is okay but you may remove duplicates
+]
+
 INTERVAL = "5minute"
-RISK_PER_TRADE = 0.1            # 10% risk per trade
+RISK_PER_TRADE = 0.03            # Changed default to 3% (you can tune this)
 MAX_POSITIONS = 10
 EXCEL_FILE = "strategy_trades.xlsx"
-MIN_QTY = 5
+MIN_QTY = 1                      # minimum quantity to place (set 5 if broker requires)
 BUFFER_AMOUNT = 500
 BROKERAGE_PERCENTAGE = 0.0003
 CHARGES_PERCENTAGE = 0.0005
@@ -31,15 +41,18 @@ ATR_PERIOD = 14
 SMA_PERIOD = 20
 MIN_PROFIT_MARGIN = 1.5
 
-DAILY_TARGET = 1000.0           # Daily profit goal
-DAILY_MAX_LOSS = -2000.0        # Maximum allowed loss per day
-SYMBOL_COOLDOWN_MIN = 15        # Minutes cooldown per symbol
+DAILY_TARGET = 1000.0
+DAILY_MAX_LOSS = -2000.0
+SYMBOL_COOLDOWN_MIN = 15
 
 # --- Globals ---
 positions = {}
 last_squareoff_date = None
 DAILY_PNL = 0.0
 last_trade_time = defaultdict(lambda: None)
+
+# track per-strategy performance (PnL, trades)
+strategy_perf = defaultdict(lambda: {"pnl": 0.0, "trades": 0})
 
 API_KEY = 'bzr39uzdxj8keovr'
 ACCESS_TOKEN = access_token.get_access_token()
@@ -64,7 +77,6 @@ def price_based_target_sl(entry, atr_value, action, target_atr=3.0, sl_atr=1.5):
         target = entry - atr_value * target_atr
         stoploss = entry + atr_value * sl_atr
     return float(target), float(stoploss)
-
 
 def calculate_atr(df, period=ATR_PERIOD):
     high = df['high']
@@ -92,26 +104,18 @@ def get_available_balance():
 def estimate_charges(entry_price, qty):
     return entry_price * qty * (BROKERAGE_PERCENTAGE + CHARGES_PERCENTAGE)
 
-# def calculate_qty_risk_based(entry_price, stoploss_price, available_balance, risk_per_trade=RISK_PER_TRADE):
-#     per_share_risk = abs(entry_price - stoploss_price)
-#     risk_amount = available_balance * risk_per_trade
-#     if per_share_risk == 0:
-#         return 0
-#     qty = int(risk_amount / per_share_risk)
-#     print(f"[DEBUG] entry={entry_price}, stoploss={stoploss_price}, per_share_risk={per_share_risk}, risk_amount={risk_amount}, qty={qty}")
-#     return qty
-
 def calculate_qty_risk_based(entry_price, stoploss_price, available_balance, risk_per_trade=RISK_PER_TRADE):
     per_share_risk = abs(entry_price - stoploss_price)
     risk_amount = available_balance * risk_per_trade
-    if per_share_risk == 0:
+    if per_share_risk <= 0:
         return 0
     qty = int(risk_amount / per_share_risk)
-    max_qty = int(available_balance / entry_price)
+    # cap qty by available balance and minimum qty
+    max_qty = int(available_balance / entry_price) if entry_price > 0 else 0
     qty = min(qty, max_qty)
+    if qty < MIN_QTY:
+        return 0
     return qty
-
-
 
 # --- Excel Logging ---
 def init_excel():
@@ -149,14 +153,29 @@ def update_trade(symbol, exit_price, pnl, order_id=None):
     df.loc[idx, "Status"] = "CLOSED"
     if order_id:
         df.loc[idx, "OrderID"] = order_id
+    strategy_name = df.loc[idx, "Strategy"]
     df.to_excel(EXCEL_FILE, index=False)
     DAILY_PNL += float(pnl)
+    # update strategy performance
+    try:
+        strategy_perf[strategy_name]["pnl"] += float(pnl)
+        strategy_perf[strategy_name]["trades"] += 1
+    except Exception:
+        pass
     print(f"[DAILY_PNL] Updated: {DAILY_PNL}")
+    print_strategy_performance()
+
+def print_strategy_performance():
+    print("[STRATEGY_PERF] PnL by strategy:")
+    for s, v in strategy_perf.items():
+        avg = v["pnl"] / v["trades"] if v["trades"] > 0 else 0.0
+        print(f"  {s}: trades={v['trades']}, total_pnl={v['pnl']:.2f}, avg={avg:.2f}")
 
 # --- Historical Data ---
-def fetch_historical(symbol, interval=INTERVAL, days=3):
-    instrument = f"{EXCHANGE}:{symbol}"
-    token_entry = kite.ltp(instrument).get(instrument)
+def fetch_historical(symbol, interval=INTERVAL, days=7):
+    # instrument = f"{EXCHANGE}:{symbol}"
+    instrument = symbol
+    token_entry = kite.ltp(f"{EXCHANGE}:{symbol}")[f"{EXCHANGE}:{symbol}"]["last_price"]
     if token_entry is None:
         raise RuntimeError(f"Couldn't fetch instrument token for {instrument}")
     token = token_entry["instrument_token"]
@@ -164,9 +183,180 @@ def fetch_historical(symbol, interval=INTERVAL, days=3):
     from_date = to_date - datetime.timedelta(days=days)
     data = kite.historical_data(token, from_date, to_date, interval)
     df = pd.DataFrame(data)
+    if df.empty:
+        return df
     df = df[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
     df.set_index('date', inplace=True)
+    # ensure numeric types
+    df = df.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float})
     return df
+
+# --- Strategy Implementations ---
+def strat_macd_signal(df):
+    """
+    MACD crossover: buy when MACD crosses above signal, sell on cross below.
+    """
+    if len(df) < 35:
+        return None
+    close = df['close'].values
+    macd, macdsignal, macdhist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+    if np.isnan(macd[-1]) or np.isnan(macdsignal[-1]) or np.isnan(macd[-2]) or np.isnan(macdsignal[-2]):
+        return None
+    entry = float(df['close'].iloc[-1])
+    atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
+    # crossover logic
+    if macd[-1] > macdsignal[-1] and macd[-2] <= macdsignal[-2]:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
+        score = float(abs(macdhist[-1])) / (abs(entry) + 1e-6)
+        return dict(action="BUY", target=target, stoploss=stoploss, score=score)
+    if macd[-1] < macdsignal[-1] and macd[-2] >= macdsignal[-2]:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
+        score = float(abs(macdhist[-1])) / (abs(entry) + 1e-6)
+        return dict(action="SELL", target=target, stoploss=stoploss, score=score)
+    return None
+
+def strat_vwap_breakout(df):
+    """
+    VWAP breakout: buy when price crosses above VWAP and VWAP is rising; sell on break below.
+    """
+    if len(df) < 30:
+        return None
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    vol = df['volume'].fillna(0)
+    typical = (high + low + close) / 3.0
+    cum_tp_vol = (typical * vol).cumsum()
+    cum_vol = vol.cumsum().replace(0, np.nan)
+    vwap = cum_tp_vol / cum_vol
+    # last and previous
+    if np.isnan(vwap.iloc[-1]) or np.isnan(vwap.iloc[-2]):
+        return None
+    entry = float(close.iloc[-1])
+    atr_val = calculate_atr(df)
+    # breakout
+    if entry > vwap.iloc[-1] and close.iloc[-2] <= vwap.iloc[-2]:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
+        score = float((entry - vwap.iloc[-1]) / (entry + 1e-6))
+        return dict(action="BUY", target=target, stoploss=stoploss, score=score)
+    if entry < vwap.iloc[-1] and close.iloc[-2] >= vwap.iloc[-2]:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
+        score = float((vwap.iloc[-1] - entry) / (entry + 1e-6))
+        return dict(action="SELL", target=target, stoploss=stoploss, score=score)
+    return None
+
+def strat_bollinger_reversion(df):
+    """
+    Bollinger bands mean reversion: sell at upper band, buy at lower band (with confirmation).
+    """
+    if len(df) < 30:
+        return None
+    close = df['close'].values
+    upper, middle, lower = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+    if np.isnan(upper[-1]) or np.isnan(lower[-1]):
+        return None
+    entry = float(df['close'].iloc[-1])
+    atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
+    # buy when price touches or goes below lower band
+    if entry <= lower[-1]:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="BUY", target_atr=2.0, sl_atr=1.0)
+        score = float((lower[-1] - entry) / (abs(entry) + 1e-6))
+        return dict(action="BUY", target=target, stoploss=stoploss, score=abs(score))
+    # sell when price touches or goes above upper band
+    if entry >= upper[-1]:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="SELL", target_atr=2.0, sl_atr=1.0)
+        score = float((entry - upper[-1]) / (abs(entry) + 1e-6))
+        return dict(action="SELL", target=target, stoploss=stoploss, score=abs(score))
+    return None
+
+def strat_rsi_momentum(df, period=14):
+    """
+    RSI-based momentum: buy on RSI crossing up from oversold or crossing above 50; sell on reverse.
+    """
+    if len(df) < period + 5:
+        return None
+    close = df['close'].values
+    rsi = talib.RSI(close, timeperiod=period)
+    if np.isnan(rsi[-1]) or np.isnan(rsi[-2]):
+        return None
+    entry = float(df['close'].iloc[-1])
+    atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
+    # cross from oversold
+    if rsi[-2] < 30 and rsi[-1] >= 30:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
+        score = float((rsi[-1] - 30) / 100.0)
+        return dict(action="BUY", target=target, stoploss=stoploss, score=score)
+    # cross above neutral 50
+    if rsi[-2] < 50 and rsi[-1] >= 50:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
+        score = float((rsi[-1] - 50) / 100.0)
+        return dict(action="BUY", target=target, stoploss=stoploss, score=score)
+    # sell signals
+    if rsi[-2] > 70 and rsi[-1] <= 70:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
+        score = float((70 - rsi[-1]) / 100.0)
+        return dict(action="SELL", target=target, stoploss=stoploss, score=score)
+    if rsi[-2] > 50 and rsi[-1] <= 50:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
+        score = float((50 - rsi[-1]) / 100.0)
+        return dict(action="SELL", target=target, stoploss=stoploss, score=score)
+    return None
+
+def strat_stochastic(df, fastk=14, slowk=3, slowd=3):
+    """
+    Stochastic oscillator crossovers (slowk crosses slowd).
+    """
+    if len(df) < fastk + slowk + slowd:
+        return None
+    high = df['high'].values
+    low = df['low'].values
+    close = df['close'].values
+    slowk_arr, slowd_arr = talib.STOCH(high, low, close, fastk_period=fastk,
+                                       slowk_period=slowk, slowk_matype=0,
+                                       slowd_period=slowd, slowd_matype=0)
+    if np.isnan(slowk_arr[-1]) or np.isnan(slowd_arr[-1]) or np.isnan(slowk_arr[-2]) or np.isnan(slowd_arr[-2]):
+        return None
+    entry = float(df['close'].iloc[-1])
+    atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
+    # buy when K crosses above D (and both below 50)
+    if slowk_arr[-1] > slowd_arr[-1] and slowk_arr[-2] <= slowd_arr[-2]:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
+        score = float((slowd_arr[-1] - slowk_arr[-1]) / (entry + 1e-6))
+        return dict(action="BUY", target=target, stoploss=stoploss, score=abs(score) + (50 - min(slowk_arr[-1], slowd_arr[-1]))/100.0)
+    # sell when K crosses below D (and both above 50)
+    if slowk_arr[-1] < slowd_arr[-1] and slowk_arr[-2] >= slowd_arr[-2]:
+        target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
+        score = float((slowk_arr[-1] - slowd_arr[-1]) / (entry + 1e-6))
+        return dict(action="SELL", target=target, stoploss=stoploss, score=abs(score) + (max(slowk_arr[-1], slowd_arr[-1]) - 50)/100.0)
+    return None
+
+def strat_volatility_trend_atr(df):
+    """
+    Simple volatility trend using ATR vs moving average of ATR + price trend:
+    - Buy if ATR increasing and price above SMA
+    - Sell if ATR increasing and price below SMA (trend with volatility)
+    """
+    if len(df) < ATR_PERIOD + SMA_PERIOD + 5:
+        return None
+    close = df['close']
+    atr_series = pd.Series(atr(df, timeperiod=ATR_PERIOD))
+    if np.isnan(atr_series.iloc[-1]):
+        return None
+    atr_now = atr_series.iloc[-1]
+    atr_mean = atr_series.tail(10).mean()
+    sma_now = calculate_sma(df, period=SMA_PERIOD)
+    entry = float(close.iloc[-1])
+    # trending higher volatility
+    atr_increasing = atr_now > atr_mean
+    if atr_increasing and entry > sma_now:
+        target, stoploss = price_based_target_sl(entry, atr_now, action="BUY", target_atr=2.5, sl_atr=1.5)
+        score = float((atr_now - atr_mean) / (atr_mean + 1e-6))
+        return dict(action="BUY", target=target, stoploss=stoploss, score=max(0.01, score))
+    if atr_increasing and entry < sma_now:
+        target, stoploss = price_based_target_sl(entry, atr_now, action="SELL", target_atr=2.5, sl_atr=1.5)
+        score = float((atr_now - atr_mean) / (atr_mean + 1e-6))
+        return dict(action="SELL", target=target, stoploss=stoploss, score=max(0.01, score))
+    return None
 
 # --- Strategies ---
 def strat_aroon_crossover(df, timeperiod=14):
@@ -209,15 +399,26 @@ def strat_ema_crossover(df, short_period=9, long_period=21):
         return dict(action="SELL", target=target, stoploss=stoploss, score=score)
     return None
 
+# register strategies
 strategies = {
     "aroon": strat_aroon_crossover,
     "ema": strat_ema_crossover,
+    "macd": strat_macd_signal,
+    "vwap": strat_vwap_breakout,
+    "bollinger": strat_bollinger_reversion,
+    "rsi": strat_rsi_momentum,
+    "stochastic": strat_stochastic,
+    "volatility_atr": strat_volatility_trend_atr,
 }
+
+# If you already have implementations of aroon and ema earlier in file, they will be used.
+# If not present, ensure you include those implementations (from your original code).
 
 # --- Evaluate and Execute ---
 def evaluate_and_execute(symbol):
     global DAILY_PNL
     now_ist = datetime.datetime.now(ZoneInfo("Asia/Kolkata"))
+    # end-of-day guard
     if now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 15):
         return
     if DAILY_PNL >= DAILY_TARGET:
@@ -228,6 +429,9 @@ def evaluate_and_execute(symbol):
         return
     last = last_trade_time.get(symbol)
     if last and (now_ist - last).total_seconds() < SYMBOL_COOLDOWN_MIN * 60:
+        return
+    # only trade if symbol is in the configured NIFTY50 list
+    if symbol not in SYMBOLS:
         return
     try:
         df = fetch_historical(symbol, interval=INTERVAL, days=7)
@@ -242,18 +446,22 @@ def evaluate_and_execute(symbol):
         try:
             result = strategy_func(df)
             if result:
-                result['strategy'] = name
-                signals.append(result)
+                # sanity: check keys
+                if all(k in result for k in ['action','target','stoploss','score']):
+                    result['strategy'] = name
+                    signals.append(result)
         except Exception as e:
             print(f"[ERROR] Strategy {name} failed for {symbol}: {e}")
     if not signals:
         return
+    # weight signals by score
     weighted_scores = {"BUY": 0.0, "SELL": 0.0}
     for sig in signals:
         weighted_scores[sig['action']] += sig['score']
     best_action = max(weighted_scores, key=weighted_scores.get)
     if weighted_scores[best_action] <= 0 or weighted_scores[best_action] < 0.02:
         return
+    # choose best single signal in direction
     chosen = max((sig for sig in signals if sig['action'] == best_action), key=lambda x: x['score'])
     action = chosen['action']
     proposed_entry = float(df['close'].iloc[-1])
@@ -288,6 +496,7 @@ def evaluate_and_execute(symbol):
     if exposure > available_balance:
         print(f"[SKIP] Insufficient funds for {symbol}")
         return
+    # Place order
     try:
         order_id = kite.place_order(
             variety=kite.VARIETY_REGULAR,
@@ -387,6 +596,7 @@ def monitor_positions():
                 entry = positions[symbol]['entry']
                 target = positions[symbol]['target']
                 stoploss = positions[symbol]['stoploss']
+                strategy_name = positions[symbol].get('strategy')
                 try:
                     ltp = float(kite.ltp(f"{EXCHANGE}:{symbol}")[f"{EXCHANGE}:{symbol}"]["last_price"])
                 except Exception as e:
@@ -402,8 +612,6 @@ def monitor_positions():
                         exit_trade = True
                         reason = "STOPLOSS"
                 else:
-                    if ltp <= target:
-                        exit_trade = True
                     if ltp <= target:
                         exit_trade = True
                         reason = "TARGET"
@@ -433,4 +641,3 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
-
