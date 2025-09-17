@@ -1,4 +1,4 @@
-# updated_trading_bot_nifty50.py
+# updated_trading_bot_nifty50_with_improvements.py
 import time
 import datetime
 import numpy as np
@@ -18,23 +18,26 @@ warnings.filterwarnings("ignore")
 EXCHANGE = "NSE"
 
 # --- NIFTY50 symbols (common tickers) ---
-# Edit this list if you want different or updated constituents.
 SYMBOLS = [
-    "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","HDFC","KOTAKBANK","SBIN","LT",
-    "AXISBANK","ITC","BHARTIARTL","HINDUNILVR","BAJFINSV","BAJFINANCE","MARUTI",
+    "RELIANCE","TCS","INFY","HDFCBANK","ICICIBANK","KOTAKBANK","SBIN","LT",
+    "AXISBANK","ITC","BHARTIARTL","HINDUNILVR","BAJAJFINSV","BAJFINANCE","MARUTI",
     "M&M","POWERGRID","NTPC","ONGC","ULTRACEMCO","TATASTEEL","JSWSTEEL","SUNPHARMA",
     "DRREDDY","COALINDIA","BPCL","IOC","GRASIM","TECHM","WIPRO","ADANIENT","ADANIPORTS",
     "DIVISLAB","CIPLA","EICHERMOT","BRITANNIA","NESTLEIND","HCLTECH","HINDALCO","SBILIFE",
-    "TITAN","HDFCLIFE","INDUSINDBK","UPL","APOLLOHOSP","ASIANPAINT","TATAMOTORS","HEROMOTOCO",
-    "ONGC"  # duplicate is okay but you may remove duplicates
+    "TITAN","HDFCLIFE","INDUSINDBK","UPL","APOLLOHOSP","ASIANPAINT","TATAMOTORS","HEROMOTOCO"
 ]
 
 INTERVAL = "5minute"
-RISK_PER_TRADE = 0.03            # Changed default to 3% (you can tune this)
+
+# --- Money & risk tuning (set for ~₹13,000 capital) ---
+TOTAL_CAPITAL = 13000.0           # your total capital (you said ₹13,000)
+BUFFER_AMOUNT = 500               # cash reserved, not used for trading
+RISK_PER_TRADE = 0.03             # 3% of available balance per trade (tuneable)
+MAX_EXPOSURE_PCT = 0.25           # max % of available balance to allocate to a single trade
+MAX_PORTFOLIO_EXPOSURE_PCT = 0.5  # max % of available balance to have open across all trades
+MIN_QTY = 3                       # broker min qty (set 5 if needed)
 MAX_POSITIONS = 10
 EXCEL_FILE = "strategy_trades.xlsx"
-MIN_QTY = 1                      # minimum quantity to place (set 5 if broker requires)
-BUFFER_AMOUNT = 500
 BROKERAGE_PERCENTAGE = 0.0003
 CHARGES_PERCENTAGE = 0.0005
 ATR_PERIOD = 14
@@ -45,21 +48,44 @@ DAILY_TARGET = 1000.0
 DAILY_MAX_LOSS = -2000.0
 SYMBOL_COOLDOWN_MIN = 15
 
+# Execution / order handling
+SLIPPAGE_PCT = 0.0006            # 0.06% assumed slippage
+TRAILING_STOP_TRIGGER = 0.5      # start trailing when 50% of target reached
+TRAILING_STOP_STEP = 0.25        # trail step (fraction of the move)
+PARTIAL_PROFIT_PCT = 0.5         # take 50% at target (if enabled)
+DISABLE_CONSECUTIVE_LOSSES = 7   # disable strategy after N consecutive losing trades
+
+# Safety & testing
+DRY_RUN = False  # If True, do not send live orders; simulate them
+
 # --- Globals ---
-positions = {}
+positions = {}  # live positions tracked by bot: symbol -> dict(...)
 last_squareoff_date = None
 DAILY_PNL = 0.0
 last_trade_time = defaultdict(lambda: None)
 
-# track per-strategy performance (PnL, trades)
 strategy_perf = defaultdict(lambda: {"pnl": 0.0, "trades": 0})
+strategy_losses = defaultdict(int)  # consecutive losses
+disabled_strategies = set()
 
 API_KEY = 'bzr39uzdxj8keovr'
-ACCESS_TOKEN = access_token.get_access_token()
+# ACCESS_TOKEN = access_token.get_access_token()
+ACCESS_TOKEN='zIsDwp68Cr33wJVS1B52YE410A5TiYRK'
 
 # --- Kite Setup ---
 kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(ACCESS_TOKEN)
+
+# --- Utility: Kite retry wrapper ---
+def kite_retry(func, *args, retries=3, backoff=1, **kwargs):
+    for i in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print(f"[WARN] Kite API call failed (attempt {i+1}/{retries}): {e}")
+            if i == retries - 1:
+                raise
+            time.sleep(backoff * (2 ** i))
 
 # --- Technical Functions ---
 def atr(df, timeperiod=14):
@@ -92,27 +118,40 @@ def calculate_atr(df, period=ATR_PERIOD):
 def calculate_sma(df, period=SMA_PERIOD):
     return df['close'].rolling(window=period).mean().iloc[-1]
 
-def get_available_balance():
-    try:
-        margins = kite.margins("equity")
-        available = margins['available']['live_balance']
-        return max(0, available - BUFFER_AMOUNT)
-    except Exception as e:
-        print("[ERROR] Fetching balance:", e)
-        return 0
+def apply_slippage(price, side):
+    if price is None:
+        return price
+    if side == "BUY":
+        return price * (1 + SLIPPAGE_PCT)
+    else:
+        return price * (1 - SLIPPAGE_PCT)
 
 def estimate_charges(entry_price, qty):
-    return entry_price * qty * (BROKERAGE_PERCENTAGE + CHARGES_PERCENTAGE)
+    # includes brokerage, other charges + approximate slippage cost
+    base = entry_price * qty * (BROKERAGE_PERCENTAGE + CHARGES_PERCENTAGE)
+    slippage_cost = entry_price * qty * SLIPPAGE_PCT
+    return base + slippage_cost
+
+def get_available_balance():
+    try:
+        margins = kite_retry(kite.margins, "equity")
+        available = margins['available']['live_balance']
+        # avoid going negative after buffer
+        return max(0.0, float(available) - BUFFER_AMOUNT)
+    except Exception as e:
+        print("[ERROR] Fetching balance:", e)
+        # fallback to TOTAL_CAPITAL minus BUFFER if Kite fails
+        return max(0.0, TOTAL_CAPITAL - BUFFER_AMOUNT)
 
 def calculate_qty_risk_based(entry_price, stoploss_price, available_balance, risk_per_trade=RISK_PER_TRADE):
     per_share_risk = abs(entry_price - stoploss_price)
     risk_amount = available_balance * risk_per_trade
-    if per_share_risk <= 0:
+    if per_share_risk <= 0 or entry_price <= 0:
         return 0
-    qty = int(risk_amount / per_share_risk)
-    # cap qty by available balance and minimum qty
-    max_qty = int(available_balance / entry_price) if entry_price > 0 else 0
-    qty = min(qty, max_qty)
+    qty_by_risk = int(risk_amount / per_share_risk)
+    max_by_balance = int(available_balance / entry_price)
+    max_by_exposure = int((available_balance * MAX_EXPOSURE_PCT) / entry_price)
+    qty = min(qty_by_risk, max_by_balance, max_by_exposure)
     if qty < MIN_QTY:
         return 0
     return qty
@@ -135,6 +174,16 @@ def log_trade(row):
                                    "Target", "Stoploss", "Strategy", "PnL", "Status", "OrderID"])
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     df.to_excel(EXCEL_FILE, index=False)
+
+def record_strategy_result(strategy, pnl):
+    # update consecutive losses and disable strategy if needed
+    if pnl < 0:
+        strategy_losses[strategy] += 1
+    else:
+        strategy_losses[strategy] = 0
+    if strategy_losses[strategy] >= DISABLE_CONSECUTIVE_LOSSES:
+        disabled_strategies.add(strategy)
+        print(f"[ACTION] Disabling strategy {strategy} after {DISABLE_CONSECUTIVE_LOSSES} consecutive losses")
 
 def update_trade(symbol, exit_price, pnl, order_id=None):
     global DAILY_PNL
@@ -164,6 +213,11 @@ def update_trade(symbol, exit_price, pnl, order_id=None):
         pass
     print(f"[DAILY_PNL] Updated: {DAILY_PNL}")
     print_strategy_performance()
+    # record for consecutive losses & possible disable
+    try:
+        record_strategy_result(strategy_name, float(pnl))
+    except Exception:
+        pass
 
 def print_strategy_performance():
     print("[STRATEGY_PERF] PnL by strategy:")
@@ -172,30 +226,29 @@ def print_strategy_performance():
         print(f"  {s}: trades={v['trades']}, total_pnl={v['pnl']:.2f}, avg={avg:.2f}")
 
 # --- Historical Data ---
-def fetch_historical(symbol, interval=INTERVAL, days=7):
-    # instrument = f"{EXCHANGE}:{symbol}"
-    instrument = symbol
-    token_entry = kite.ltp(f"{EXCHANGE}:{symbol}")[f"{EXCHANGE}:{symbol}"]["last_price"]
+def fetch_historical(symbol, interval=INTERVAL, days=3):
+    instrument = f"{EXCHANGE}:{symbol}"
+    try:
+        token_entry = kite_retry(kite.ltp, instrument)[instrument]
+        # print(token_entry)
+    except Exception as e:
+        raise RuntimeError(f"Couldn't fetch instrument token for {instrument}: {e}")
     if token_entry is None:
         raise RuntimeError(f"Couldn't fetch instrument token for {instrument}")
     token = token_entry["instrument_token"]
     to_date = datetime.datetime.now()
     from_date = to_date - datetime.timedelta(days=days)
-    data = kite.historical_data(token, from_date, to_date, interval)
+    data = kite_retry(kite.historical_data, token, from_date, to_date, interval)
     df = pd.DataFrame(data)
     if df.empty:
         return df
     df = df[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
     df.set_index('date', inplace=True)
-    # ensure numeric types
     df = df.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float})
     return df
 
 # --- Strategy Implementations ---
 def strat_macd_signal(df):
-    """
-    MACD crossover: buy when MACD crosses above signal, sell on cross below.
-    """
     if len(df) < 35:
         return None
     close = df['close'].values
@@ -204,7 +257,6 @@ def strat_macd_signal(df):
         return None
     entry = float(df['close'].iloc[-1])
     atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
-    # crossover logic
     if macd[-1] > macdsignal[-1] and macd[-2] <= macdsignal[-2]:
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
         score = float(abs(macdhist[-1])) / (abs(entry) + 1e-6)
@@ -216,9 +268,6 @@ def strat_macd_signal(df):
     return None
 
 def strat_vwap_breakout(df):
-    """
-    VWAP breakout: buy when price crosses above VWAP and VWAP is rising; sell on break below.
-    """
     if len(df) < 30:
         return None
     high = df['high']
@@ -229,12 +278,10 @@ def strat_vwap_breakout(df):
     cum_tp_vol = (typical * vol).cumsum()
     cum_vol = vol.cumsum().replace(0, np.nan)
     vwap = cum_tp_vol / cum_vol
-    # last and previous
     if np.isnan(vwap.iloc[-1]) or np.isnan(vwap.iloc[-2]):
         return None
     entry = float(close.iloc[-1])
     atr_val = calculate_atr(df)
-    # breakout
     if entry > vwap.iloc[-1] and close.iloc[-2] <= vwap.iloc[-2]:
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
         score = float((entry - vwap.iloc[-1]) / (entry + 1e-6))
@@ -246,9 +293,6 @@ def strat_vwap_breakout(df):
     return None
 
 def strat_bollinger_reversion(df):
-    """
-    Bollinger bands mean reversion: sell at upper band, buy at lower band (with confirmation).
-    """
     if len(df) < 30:
         return None
     close = df['close'].values
@@ -257,12 +301,10 @@ def strat_bollinger_reversion(df):
         return None
     entry = float(df['close'].iloc[-1])
     atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
-    # buy when price touches or goes below lower band
     if entry <= lower[-1]:
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY", target_atr=2.0, sl_atr=1.0)
         score = float((lower[-1] - entry) / (abs(entry) + 1e-6))
         return dict(action="BUY", target=target, stoploss=stoploss, score=abs(score))
-    # sell when price touches or goes above upper band
     if entry >= upper[-1]:
         target, stoploss = price_based_target_sl(entry, atr_val, action="SELL", target_atr=2.0, sl_atr=1.0)
         score = float((entry - upper[-1]) / (abs(entry) + 1e-6))
@@ -270,9 +312,6 @@ def strat_bollinger_reversion(df):
     return None
 
 def strat_rsi_momentum(df, period=14):
-    """
-    RSI-based momentum: buy on RSI crossing up from oversold or crossing above 50; sell on reverse.
-    """
     if len(df) < period + 5:
         return None
     close = df['close'].values
@@ -281,17 +320,14 @@ def strat_rsi_momentum(df, period=14):
         return None
     entry = float(df['close'].iloc[-1])
     atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
-    # cross from oversold
     if rsi[-2] < 30 and rsi[-1] >= 30:
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
         score = float((rsi[-1] - 30) / 100.0)
         return dict(action="BUY", target=target, stoploss=stoploss, score=score)
-    # cross above neutral 50
     if rsi[-2] < 50 and rsi[-1] >= 50:
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
         score = float((rsi[-1] - 50) / 100.0)
         return dict(action="BUY", target=target, stoploss=stoploss, score=score)
-    # sell signals
     if rsi[-2] > 70 and rsi[-1] <= 70:
         target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
         score = float((70 - rsi[-1]) / 100.0)
@@ -303,9 +339,6 @@ def strat_rsi_momentum(df, period=14):
     return None
 
 def strat_stochastic(df, fastk=14, slowk=3, slowd=3):
-    """
-    Stochastic oscillator crossovers (slowk crosses slowd).
-    """
     if len(df) < fastk + slowk + slowd:
         return None
     high = df['high'].values
@@ -318,12 +351,10 @@ def strat_stochastic(df, fastk=14, slowk=3, slowd=3):
         return None
     entry = float(df['close'].iloc[-1])
     atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
-    # buy when K crosses above D (and both below 50)
     if slowk_arr[-1] > slowd_arr[-1] and slowk_arr[-2] <= slowd_arr[-2]:
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
         score = float((slowd_arr[-1] - slowk_arr[-1]) / (entry + 1e-6))
         return dict(action="BUY", target=target, stoploss=stoploss, score=abs(score) + (50 - min(slowk_arr[-1], slowd_arr[-1]))/100.0)
-    # sell when K crosses below D (and both above 50)
     if slowk_arr[-1] < slowd_arr[-1] and slowk_arr[-2] >= slowd_arr[-2]:
         target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
         score = float((slowk_arr[-1] - slowd_arr[-1]) / (entry + 1e-6))
@@ -331,11 +362,6 @@ def strat_stochastic(df, fastk=14, slowk=3, slowd=3):
     return None
 
 def strat_volatility_trend_atr(df):
-    """
-    Simple volatility trend using ATR vs moving average of ATR + price trend:
-    - Buy if ATR increasing and price above SMA
-    - Sell if ATR increasing and price below SMA (trend with volatility)
-    """
     if len(df) < ATR_PERIOD + SMA_PERIOD + 5:
         return None
     close = df['close']
@@ -346,7 +372,6 @@ def strat_volatility_trend_atr(df):
     atr_mean = atr_series.tail(10).mean()
     sma_now = calculate_sma(df, period=SMA_PERIOD)
     entry = float(close.iloc[-1])
-    # trending higher volatility
     atr_increasing = atr_now > atr_mean
     if atr_increasing and entry > sma_now:
         target, stoploss = price_based_target_sl(entry, atr_now, action="BUY", target_atr=2.5, sl_atr=1.5)
@@ -358,7 +383,7 @@ def strat_volatility_trend_atr(df):
         return dict(action="SELL", target=target, stoploss=stoploss, score=max(0.01, score))
     return None
 
-# --- Strategies ---
+# --- Base strategies (Aroon & EMA kept from original) ---
 def strat_aroon_crossover(df, timeperiod=14):
     if len(df) < timeperiod + 3:
         return None
@@ -411,9 +436,6 @@ strategies = {
     "volatility_atr": strat_volatility_trend_atr,
 }
 
-# If you already have implementations of aroon and ema earlier in file, they will be used.
-# If not present, ensure you include those implementations (from your original code).
-
 # --- Evaluate and Execute ---
 def evaluate_and_execute(symbol):
     global DAILY_PNL
@@ -430,7 +452,6 @@ def evaluate_and_execute(symbol):
     last = last_trade_time.get(symbol)
     if last and (now_ist - last).total_seconds() < SYMBOL_COOLDOWN_MIN * 60:
         return
-    # only trade if symbol is in the configured NIFTY50 list
     if symbol not in SYMBOLS:
         return
     try:
@@ -443,13 +464,13 @@ def evaluate_and_execute(symbol):
     sma = calculate_sma(df)
     signals = []
     for name, strategy_func in strategies.items():
+        if name in disabled_strategies:
+            continue
         try:
             result = strategy_func(df)
-            if result:
-                # sanity: check keys
-                if all(k in result for k in ['action','target','stoploss','score']):
-                    result['strategy'] = name
-                    signals.append(result)
+            if result and all(k in result for k in ['action','target','stoploss','score']):
+                result['strategy'] = name
+                signals.append(result)
         except Exception as e:
             print(f"[ERROR] Strategy {name} failed for {symbol}: {e}")
     if not signals:
@@ -461,7 +482,6 @@ def evaluate_and_execute(symbol):
     best_action = max(weighted_scores, key=weighted_scores.get)
     if weighted_scores[best_action] <= 0 or weighted_scores[best_action] < 0.02:
         return
-    # choose best single signal in direction
     chosen = max((sig for sig in signals if sig['action'] == best_action), key=lambda x: x['score'])
     action = chosen['action']
     proposed_entry = float(df['close'].iloc[-1])
@@ -493,31 +513,42 @@ def evaluate_and_execute(symbol):
         print(f"[SKIP] Trade not worth it for {symbol}")
         return
     exposure = proposed_entry * qty
+    # portfolio exposure check (prevent > MAX_PORTFOLIO_EXPOSURE_PCT)
+    current_exposure = sum(p['entry'] * p['qty'] for p in positions.values())
+    if (current_exposure + exposure) > (available_balance * MAX_PORTFOLIO_EXPOSURE_PCT):
+        print(f"[SKIP] Would exceed portfolio exposure for {symbol}")
+        return
     if exposure > available_balance:
         print(f"[SKIP] Insufficient funds for {symbol}")
         return
-    # Place order
+    # Place order (DRY_RUN safe)
     try:
-        order_id = kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=EXCHANGE,
-            tradingsymbol=symbol,
-            transaction_type=kite.TRANSACTION_TYPE_BUY if action == "BUY" else kite.TRANSACTION_TYPE_SELL,
-            quantity=qty,
-            product=kite.PRODUCT_MIS,
-            order_type=kite.ORDER_TYPE_MARKET,
-            validity=kite.VALIDITY_DAY
-        )
-        print(f"[ORDER_PLACED] {action} {qty} {symbol}, order_id={order_id}")
+        if DRY_RUN:
+            order_id = f"DRY-{symbol}-{int(time.time())}"
+            print(f"[DRY_RUN] Simulated order {order_id}: {action} {qty} {symbol}")
+        else:
+            order_id = kite_retry(kite.place_order,
+                                  variety=kite.VARIETY_REGULAR,
+                                  exchange=EXCHANGE,
+                                  tradingsymbol=symbol,
+                                  transaction_type=kite.TRANSACTION_TYPE_BUY if action == "BUY" else kite.TRANSACTION_TYPE_SELL,
+                                  quantity=qty,
+                                  product=kite.PRODUCT_MIS,
+                                  order_type=kite.ORDER_TYPE_MARKET,
+                                  validity=kite.VALIDITY_DAY)
+            print(f"[ORDER_PLACED] {action} {qty} {symbol}, order_id={order_id}")
     except Exception as e:
         print(f"[ERROR] Order failed for {symbol}: {e}")
         return
     executed_price = None
     try:
-        executed_price = float(kite.ltp(f"{EXCHANGE}:{symbol}")[f"{EXCHANGE}:{symbol}"]["last_price"])
+        ltp_resp = kite_retry(kite.ltp, f"{EXCHANGE}:{symbol}")
+        executed_price = float(ltp_resp[f"{EXCHANGE}:{symbol}"]["last_price"])
     except Exception as e:
         print(f"[WARN] Couldn't fetch executed price; using proposed entry. {e}")
         executed_price = proposed_entry
+    # apply slippage
+    executed_price = apply_slippage(executed_price, action)
     positions[symbol] = dict(side=action, qty=qty, entry=executed_price, target=target, stoploss=stoploss, strategy=strategy_name, order_id=order_id)
     last_trade_time[symbol] = datetime.datetime.now(ZoneInfo("Asia/Kolkata"))
     log_trade({
@@ -539,23 +570,27 @@ def evaluate_and_execute(symbol):
 def place_exit_order(symbol, side, qty):
     try:
         opposite = kite.TRANSACTION_TYPE_SELL if side == "BUY" else kite.TRANSACTION_TYPE_BUY
-        return kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=EXCHANGE,
-            tradingsymbol=symbol,
-            transaction_type=opposite,
-            quantity=qty,
-            product=kite.PRODUCT_MIS,
-            order_type=kite.ORDER_TYPE_MARKET,
-            validity=kite.VALIDITY_DAY
-        )
+        if DRY_RUN:
+            order_id = f"DRY-EXIT-{symbol}-{int(time.time())}"
+            print(f"[DRY_RUN] Simulated exit {order_id}: {opposite} {qty} {symbol}")
+            return order_id
+        return kite_retry(kite.place_order,
+                          variety=kite.VARIETY_REGULAR,
+                          exchange=EXCHANGE,
+                          tradingsymbol=symbol,
+                          transaction_type=opposite,
+                          quantity=qty,
+                          product=kite.PRODUCT_MIS,
+                          order_type=kite.ORDER_TYPE_MARKET,
+                          validity=kite.VALIDITY_DAY)
     except Exception as e:
         print(f"[ERROR] Exit order for {symbol} failed:", e)
         return None
 
 def fetch_live_net_positions():
     try:
-        return kite.positions().get('net', [])
+        pos = kite_retry(kite.positions)
+        return pos.get('net', [])
     except Exception as e:
         print("[ERROR] Fetching live positions failed:", e)
         return []
@@ -598,12 +633,14 @@ def monitor_positions():
                 stoploss = positions[symbol]['stoploss']
                 strategy_name = positions[symbol].get('strategy')
                 try:
-                    ltp = float(kite.ltp(f"{EXCHANGE}:{symbol}")[f"{EXCHANGE}:{symbol}"]["last_price"])
+                    ltp_resp = kite_retry(kite.ltp, f"{EXCHANGE}:{symbol}")
+                    ltp = float(ltp_resp[f"{EXCHANGE}:{symbol}"]["last_price"])
                 except Exception as e:
                     print(f"[ERROR] LTP fetch failed for {symbol}: {e}")
                     continue
                 exit_trade = False
                 reason = ""
+                # trailing and partial logic
                 if side == "BUY":
                     if ltp >= target:
                         exit_trade = True
@@ -611,18 +648,75 @@ def monitor_positions():
                     elif ltp <= stoploss:
                         exit_trade = True
                         reason = "STOPLOSS"
-                else:
+                    else:
+                        # trailing
+                        if ltp >= entry + TRAILING_STOP_TRIGGER * (target - entry):
+                            new_stop = entry + TRAILING_STOP_STEP * (ltp - entry)
+                            if new_stop > positions[symbol]['stoploss']:
+                                positions[symbol]['stoploss'] = new_stop
+                                print(f"[TRAIL] Adjusted SL for {symbol} to {new_stop}")
+                else:  # SELL
                     if ltp <= target:
                         exit_trade = True
                         reason = "TARGET"
                     elif ltp >= stoploss:
                         exit_trade = True
                         reason = "STOPLOSS"
+                    else:
+                        if ltp <= entry - TRAILING_STOP_TRIGGER * (entry - target):
+                            new_stop = entry - TRAILING_STOP_STEP * (entry - ltp)
+                            if new_stop < positions[symbol]['stoploss']:
+                                positions[symbol]['stoploss'] = new_stop
+                                print(f"[TRAIL] Adjusted SL for {symbol} to {new_stop}")
                 if exit_trade:
                     print(f"[EXIT] {symbol} hitting {reason}: LTP={ltp}, Entry={entry}, Target={target}, SL={stoploss}")
+                    # partial exit handling
+                    if PARTIAL_PROFIT_PCT < 1.0 and reason == "TARGET":
+                        total_qty = positions[symbol]['qty']
+                        partial_qty = int(total_qty * PARTIAL_PROFIT_PCT)
+                        remaining_qty = total_qty - partial_qty
+                        if partial_qty > 0:
+                            order_id_partial = place_exit_order(symbol, side, partial_qty)
+                            pnl_partial = round((ltp - entry) * partial_qty * (1 if side == "BUY" else -1), 2)
+                            print(f"[PARTIAL_EXIT] {symbol} qty={partial_qty} pnl={pnl_partial}")
+                            # log partial as a closed row (optional simple approach)
+                            log_trade({
+                                "Date": now.replace(tzinfo=None),
+                                "Symbol": symbol,
+                                "Side": side,
+                                "Qty": partial_qty,
+                                "Entry": entry,
+                                "Exit": ltp,
+                                "Target": target,
+                                "Stoploss": stoploss,
+                                "Strategy": strategy_name,
+                                "PnL": pnl_partial,
+                                "Status": "CLOSED_PARTIAL",
+                                "OrderID": order_id_partial
+                            })
+                            # update strategy perf and DAILY_PNL for partial
+                            strategy_perf[strategy_name]["pnl"] += pnl_partial
+                            strategy_perf[strategy_name]["trades"] += 1
+                            DAILY_PNL += pnl_partial
+                            record_strategy_result(strategy_name, pnl_partial)
+                        # if nothing left, fully close housekeeping done below
+                        if remaining_qty <= 0:
+                            # fully closed - nothing remaining
+                            order_id = place_exit_order(symbol, side, remaining_qty if remaining_qty>0 else 0)
+                            pnl_full = 0.0
+                            # record full close as well (already handled partial)
+                            positions.pop(symbol, None)
+                            continue
+                        else:
+                            # update remaining qty and continue monitoring
+                            positions[symbol]['qty'] = remaining_qty
+                            # update the entry (optional) or keep same entry to track pnl on remaining position
+                            continue
+                    # full exit
                     order_id = place_exit_order(symbol, side, quantity)
                     pnl = round((ltp - entry) * quantity * (1 if side == "BUY" else -1), 2)
                     update_trade(symbol, ltp, pnl, order_id)
+                    # remove from positions tracked
                     positions.pop(symbol, None)
         time.sleep(2)
 
