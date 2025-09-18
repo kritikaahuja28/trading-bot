@@ -292,23 +292,71 @@ def fetch_historical(symbol, interval=INTERVAL, days=3):
     df = df.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float})
     return df
 
-# --- Strategy Implementations ---
+import numpy as np
+import pandas as pd
+import talib
+
+ATR_PERIOD = 14
+SMA_PERIOD = 50
+
+def atr(df, timeperiod=ATR_PERIOD):
+    return talib.ATR(df['high'], df['low'], df['close'], timeperiod=timeperiod)
+
+def calculate_atr(df, timeperiod=ATR_PERIOD):
+    atr_series = atr(df, timeperiod)
+    return atr_series.iloc[-1] if not np.isnan(atr_series.iloc[-1]) else 0
+
+def calculate_sma(df, period=SMA_PERIOD):
+    sma_series = talib.SMA(df['close'], timeperiod=period)
+    return sma_series.iloc[-1] if not np.isnan(sma_series.iloc[-1]) else 0
+
+def price_based_target_sl(entry, atr_val, action="BUY", target_atr=2.0, sl_atr=1.0):
+    target = entry + target_atr * atr_val if action == "BUY" else entry - target_atr * atr_val
+    stoploss = entry - sl_atr * atr_val if action == "BUY" else entry + sl_atr * atr_val
+    return target, stoploss
+
+def is_trending(df, period=50):
+    # Confirm trend by checking if price is above or below SMA
+    if len(df) < period:
+        return None
+    sma = calculate_sma(df, period)
+    entry = df['close'].iloc[-1]
+    if entry > sma:
+        return "UP"
+    elif entry < sma:
+        return "DOWN"
+    else:
+        return None
+
+def has_minimum_volume(df, min_volume=1000):
+    return df['volume'].iloc[-1] >= min_volume
+
+def smooth_series(series, period=3):
+    return pd.Series(series).rolling(window=period).mean().iloc[-1]
+
 def strat_macd_signal(df):
     if len(df) < 35:
         return None
     close = df['close'].values
     macd, macdsignal, macdhist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-    if np.isnan(macd[-1]) or np.isnan(macdsignal[-1]) or np.isnan(macd[-2]) or np.isnan(macdsignal[-2]):
+    if np.isnan(macd[-1]) or np.isnan(macdsignal[-1]):
         return None
     entry = float(df['close'].iloc[-1])
-    atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
-    if macd[-1] > macdsignal[-1] and macd[-2] <= macdsignal[-2]:
+    atr_val = calculate_atr(df)
+    trend = is_trending(df)
+    if trend is None or not has_minimum_volume(df):
+        return None
+    if macd[-1] > macdsignal[-1] and macd[-2] <= macdsignal[-2] and trend == "UP":
+        score = abs(macdhist[-1]) / (entry + 1e-6)
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
-        score = float(abs(macdhist[-1])) / (abs(entry) + 1e-6)
         return dict(action="BUY", target=target, stoploss=stoploss, score=score)
-    if macd[-1] < macdsignal[-1] and macd[-2] >= macdsignal[-2]:
+    if macd[-1] < macdsignal[-1] and macd[-2] >= macdsignal[-2] and trend == "DOWN":
+        score = abs(macdhist[-1]) / (entry + 1e-6)
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
-        score = float(abs(macdhist[-1])) / (abs(entry) + 1e-6)
         return dict(action="SELL", target=target, stoploss=stoploss, score=score)
     return None
 
@@ -327,13 +375,20 @@ def strat_vwap_breakout(df):
         return None
     entry = float(close.iloc[-1])
     atr_val = calculate_atr(df)
-    if entry > vwap.iloc[-1] and close.iloc[-2] <= vwap.iloc[-2]:
+    trend = is_trending(df)
+    if trend is None or not has_minimum_volume(df):
+        return None
+    if entry > vwap.iloc[-1] and close.iloc[-2] <= vwap.iloc[-2] and trend == "UP":
+        score = (entry - vwap.iloc[-1]) / (entry + 1e-6)
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
-        score = float((entry - vwap.iloc[-1]) / (entry + 1e-6))
         return dict(action="BUY", target=target, stoploss=stoploss, score=score)
-    if entry < vwap.iloc[-1] and close.iloc[-2] >= vwap.iloc[-2]:
+    if entry < vwap.iloc[-1] and close.iloc[-2] >= vwap.iloc[-2] and trend == "DOWN":
+        score = (vwap.iloc[-1] - entry) / (entry + 1e-6)
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
-        score = float((vwap.iloc[-1] - entry) / (entry + 1e-6))
         return dict(action="SELL", target=target, stoploss=stoploss, score=score)
     return None
 
@@ -345,14 +400,21 @@ def strat_bollinger_reversion(df):
     if np.isnan(upper[-1]) or np.isnan(lower[-1]):
         return None
     entry = float(df['close'].iloc[-1])
-    atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
-    if entry <= lower[-1]:
+    atr_val = calculate_atr(df)
+    trend = is_trending(df)
+    if trend is None or not has_minimum_volume(df):
+        return None
+    if entry <= lower[-1] and trend == "UP":
+        score = (lower[-1] - entry) / (abs(entry) + 1e-6)
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY", target_atr=2.0, sl_atr=1.0)
-        score = float((lower[-1] - entry) / (abs(entry) + 1e-6))
         return dict(action="BUY", target=target, stoploss=stoploss, score=abs(score))
-    if entry >= upper[-1]:
+    if entry >= upper[-1] and trend == "DOWN":
+        score = (entry - upper[-1]) / (abs(entry) + 1e-6)
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_val, action="SELL", target_atr=2.0, sl_atr=1.0)
-        score = float((entry - upper[-1]) / (abs(entry) + 1e-6))
         return dict(action="SELL", target=target, stoploss=stoploss, score=abs(score))
     return None
 
@@ -364,22 +426,22 @@ def strat_rsi_momentum(df, period=14):
     if np.isnan(rsi[-1]) or np.isnan(rsi[-2]):
         return None
     entry = float(df['close'].iloc[-1])
-    atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
-    if rsi[-2] < 30 and rsi[-1] >= 30:
+    atr_val = calculate_atr(df)
+    trend = is_trending(df)
+    if trend is None or not has_minimum_volume(df):
+        return None
+    smoothed_rsi = smooth_series(rsi, period=3)
+    if rsi[-2] < 30 and rsi[-1] >= 30 and trend == "UP":
+        score = (rsi[-1] - 30) / 100.0
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
-        score = float((rsi[-1] - 30) / 100.0)
         return dict(action="BUY", target=target, stoploss=stoploss, score=score)
-    if rsi[-2] < 50 and rsi[-1] >= 50:
-        target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
-        score = float((rsi[-1] - 50) / 100.0)
-        return dict(action="BUY", target=target, stoploss=stoploss, score=score)
-    if rsi[-2] > 70 and rsi[-1] <= 70:
+    if rsi[-2] > 70 and rsi[-1] <= 70 and trend == "DOWN":
+        score = (70 - rsi[-1]) / 100.0
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
-        score = float((70 - rsi[-1]) / 100.0)
-        return dict(action="SELL", target=target, stoploss=stoploss, score=score)
-    if rsi[-2] > 50 and rsi[-1] <= 50:
-        target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
-        score = float((50 - rsi[-1]) / 100.0)
         return dict(action="SELL", target=target, stoploss=stoploss, score=score)
     return None
 
@@ -392,18 +454,25 @@ def strat_stochastic(df, fastk=14, slowk=3, slowd=3):
     slowk_arr, slowd_arr = talib.STOCH(high, low, close, fastk_period=fastk,
                                        slowk_period=slowk, slowk_matype=0,
                                        slowd_period=slowd, slowd_matype=0)
-    if np.isnan(slowk_arr[-1]) or np.isnan(slowd_arr[-1]) or np.isnan(slowk_arr[-2]) or np.isnan(slowd_arr[-2]):
+    if np.isnan(slowk_arr[-1]) or np.isnan(slowd_arr[-1]):
         return None
     entry = float(df['close'].iloc[-1])
-    atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
-    if slowk_arr[-1] > slowd_arr[-1] and slowk_arr[-2] <= slowd_arr[-2]:
+    atr_val = calculate_atr(df)
+    trend = is_trending(df)
+    if trend is None or not has_minimum_volume(df):
+        return None
+    if slowk_arr[-1] > slowd_arr[-1] and slowk_arr[-2] <= slowd_arr[-2] and trend == "UP":
+        score = abs(slowk_arr[-1] - slowd_arr[-1]) / 100.0
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_val, action="BUY")
-        score = float((slowd_arr[-1] - slowk_arr[-1]) / (entry + 1e-6))
-        return dict(action="BUY", target=target, stoploss=stoploss, score=abs(score) + (50 - min(slowk_arr[-1], slowd_arr[-1]))/100.0)
-    if slowk_arr[-1] < slowd_arr[-1] and slowk_arr[-2] >= slowd_arr[-2]:
+        return dict(action="BUY", target=target, stoploss=stoploss, score=score)
+    if slowk_arr[-1] < slowd_arr[-1] and slowk_arr[-2] >= slowd_arr[-2] and trend == "DOWN":
+        score = abs(slowk_arr[-1] - slowd_arr[-1]) / 100.0
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_val, action="SELL")
-        score = float((slowk_arr[-1] - slowd_arr[-1]) / (entry + 1e-6))
-        return dict(action="SELL", target=target, stoploss=stoploss, score=abs(score) + (max(slowk_arr[-1], slowd_arr[-1]) - 50)/100.0)
+        return dict(action="SELL", target=target, stoploss=stoploss, score=score)
     return None
 
 def strat_volatility_trend_atr(df):
@@ -417,36 +486,50 @@ def strat_volatility_trend_atr(df):
     atr_mean = atr_series.tail(10).mean()
     sma_now = calculate_sma(df, period=SMA_PERIOD)
     entry = float(close.iloc[-1])
+    trend = is_trending(df)
+    if trend is None or not has_minimum_volume(df):
+        return None
     atr_increasing = atr_now > atr_mean
-    if atr_increasing and entry > sma_now:
+    if atr_increasing and entry > sma_now and trend == "UP":
+        score = (atr_now - atr_mean) / (atr_mean + 1e-6)
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_now, action="BUY", target_atr=2.5, sl_atr=1.5)
-        score = float((atr_now - atr_mean) / (atr_mean + 1e-6))
-        return dict(action="BUY", target=target, stoploss=stoploss, score=max(0.01, score))
-    if atr_increasing and entry < sma_now:
+        return dict(action="BUY", target=target, stoploss=stoploss, score=score)
+    if atr_increasing and entry < sma_now and trend == "DOWN":
+        score = (atr_now - atr_mean) / (atr_mean + 1e-6)
+        if score < 0.01:
+            return None
         target, stoploss = price_based_target_sl(entry, atr_now, action="SELL", target_atr=2.5, sl_atr=1.5)
-        score = float((atr_now - atr_mean) / (atr_mean + 1e-6))
-        return dict(action="SELL", target=target, stoploss=stoploss, score=max(0.01, score))
+        return dict(action="SELL", target=target, stoploss=stoploss, score=score)
     return None
 
-# --- Base strategies (Aroon & EMA kept from original) ---
 def strat_aroon_crossover(df, timeperiod=14):
     if len(df) < timeperiod + 3:
         return None
     aroon_down, aroon_up = talib.AROON(df['high'].values, df['low'].values, timeperiod=timeperiod)
-    if np.isnan(aroon_up[-1]) or np.isnan(aroon_down[-1]) or np.isnan(aroon_up[-2]) or np.isnan(aroon_down[-2]):
+    if np.isnan(aroon_up[-1]) or np.isnan(aroon_down[-1]):
         return None
     entry = float(df['close'].iloc[-1])
-    atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
-    long_ema = talib.EMA(df['close'].values, timeperiod=50)[-1]
-    if aroon_up[-1] > aroon_down[-1] and aroon_up[-2] <= aroon_down[-2] and entry > long_ema:
-        target, stoploss = price_based_target_sl(entry, atr_val, target_atr=3.0, sl_atr=1.5,action="BUY")
-        score = float((aroon_up[-1] - aroon_down[-1]) / 100.0)
+    atr_val = calculate_atr(df)
+    trend = is_trending(df)
+    if trend is None or not has_minimum_volume(df):
+        return None
+    long_ema = calculate_sma(df, period=50)
+    if aroon_up[-1] > aroon_down[-1] and aroon_up[-2] <= aroon_down[-2] and entry > long_ema and trend == "UP":
+        score = abs(aroon_up[-1] - aroon_down[-1]) / 100.0
+        if score < 0.01:
+            return None
+        target, stoploss = price_based_target_sl(entry, atr_val, action="BUY", target_atr=3.0, sl_atr=1.5)
         return dict(action="BUY", target=target, stoploss=stoploss, score=score)
-    if aroon_down[-1] > aroon_up[-1] and aroon_down[-2] <= aroon_up[-2] and entry < long_ema:
-        target, stoploss = price_based_target_sl(entry, atr_val, target_atr=3.0, sl_atr=1.5,action="SELL")
-        score = float((aroon_down[-1] - aroon_up[-1]) / 100.0)
+    if aroon_down[-1] > aroon_up[-1] and aroon_down[-2] <= aroon_up[-2] and entry < long_ema and trend == "DOWN":
+        score = abs(aroon_down[-1] - aroon_up[-1]) / 100.0
+        if score < 0.01:
+            return None
+        target, stoploss = price_based_target_sl(entry, atr_val, action="SELL", target_atr=3.0, sl_atr=1.5)
         return dict(action="SELL", target=target, stoploss=stoploss, score=score)
     return None
+
 
 def strat_ema_crossover(df, short_period=9, long_period=21):
     if len(df) < long_period + 3:
@@ -454,22 +537,29 @@ def strat_ema_crossover(df, short_period=9, long_period=21):
     close = df['close'].values
     ema_short = talib.EMA(close, timeperiod=short_period)
     ema_long = talib.EMA(close, timeperiod=long_period)
-    if np.isnan(ema_short[-1]) or np.isnan(ema_long[-1]) or np.isnan(ema_short[-2]) or np.isnan(ema_long[-2]):
+    if np.isnan(ema_short[-1]) or np.isnan(ema_long[-1]):
         return None
     entry = float(df['close'].iloc[-1])
-    atr_val = atr(df, timeperiod=ATR_PERIOD)[-1]
-    long_ema = talib.EMA(close, timeperiod=50)[-1]
-    if ema_short[-1] > ema_long[-1] and ema_short[-2] <= ema_long[-2] and entry > long_ema:
-        target, stoploss = price_based_target_sl(entry, atr_val, target_atr=3.0, sl_atr=1.5,action="BUY")
-        score = float((ema_short[-1] - ema_long[-1]) / entry)
+    atr_val = calculate_atr(df)
+    trend = is_trending(df)
+    if trend is None or not has_minimum_volume(df):
+        return None
+    long_ema = calculate_sma(df, period=50)
+    if ema_short[-1] > ema_long[-1] and ema_short[-2] <= ema_long[-2] and entry > long_ema and trend == "UP":
+        score = abs(ema_short[-1] - ema_long[-1]) / entry
+        if score < 0.001:
+            return None
+        target, stoploss = price_based_target_sl(entry, atr_val, action="BUY", target_atr=3.0, sl_atr=1.5)
         return dict(action="BUY", target=target, stoploss=stoploss, score=score)
-    if ema_long[-1] > ema_short[-1] and ema_long[-2] <= ema_short[-2] and entry < long_ema:
-        target, stoploss = price_based_target_sl(entry, atr_val, target_atr=3.0, sl_atr=1.5,action="SELL")
-        score = float((ema_long[-1] - ema_short[-1]) / entry)
+    if ema_long[-1] > ema_short[-1] and ema_long[-2] <= ema_short[-2] and entry < long_ema and trend == "DOWN":
+        score = abs(ema_long[-1] - ema_short[-1]) / entry
+        if score < 0.001:
+            return None
+        target, stoploss = price_based_target_sl(entry, atr_val, action="SELL", target_atr=3.0, sl_atr=1.5)
         return dict(action="SELL", target=target, stoploss=stoploss, score=score)
     return None
 
-# register strategies
+
 strategies = {
     "aroon": strat_aroon_crossover,
     "ema": strat_ema_crossover,
@@ -480,6 +570,8 @@ strategies = {
     "stochastic": strat_stochastic,
     "volatility_atr": strat_volatility_trend_atr,
 }
+
+
 
 # --- Stop-loss management helpers ---
 def place_stop_order_on_kite(symbol, side, qty, stop_price):
